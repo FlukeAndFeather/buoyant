@@ -1,0 +1,121 @@
+---
+title: "Where's neutral buoyancy?"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(ggpubr)
+library(ggsci)
+# Set root directory to project root
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r utilities}
+# Detect dives in PRH
+det_dives <- function(p, dive_thr = 5) {
+  descent <- p >= dive_thr & lag(p) < dive_thr
+  dive_idx0 <- cumsum(replace_na(descent, 0))
+  ifelse(p <= dive_thr, 0, dive_idx0)
+}
+
+# Detect gliding phases
+## Set stroke boundaries. A "glide" is 2x typical period w/out stroke.
+stroke_thr <- 0.025
+stroke_f <- 0.15
+stroke_T <- 1 / stroke_f
+det_glides <- function(gyr) {
+  
+  # Recenter gyros and find strokes
+  gyr <- gyr - mean(gyr)
+  strokes <- abs(gyr) > stroke_thr
+  
+  # Run length encoding of strokes
+  stroke_rle <- rle(strokes)
+  
+  # Number of points for a phase to count as a glide
+  n_glide <- stroke_T * 2 / 0.1
+  
+  # Find glide phases of sufficient length
+  map2(stroke_rle$values,
+       stroke_rle$lengths,
+       ~ rep(.x == FALSE & .y > n_glide, each = .y)) %>% 
+    unlist
+}
+```
+
+```{r data}
+prh_fp <- "data/bw170813-44/bw170813-44 10Hzprh.csv"
+prh <- read_csv(prh_fp) %>% 
+  mutate(dive_idx = det_dives(p),
+         Gy = RcppRoll::roll_mean(Gy, n = 15, fill = NA),
+         pitch = pitch * 180/pi) %>% 
+  group_by(dive_idx) %>% 
+  mutate(Gy = ifelse(dive_idx > 0, Gy - mean(Gy), Gy),
+         is_glide = ifelse(dive_idx > 0, det_glides(Gy), NA)) %>% 
+  ungroup
+```
+
+```{r dive_gyro}
+plot_dive <- function(dive) {
+  dive_data <- filter(prh, dive_idx == dive)
+  
+  first_glide <- first(which(dive_data$is_glide == TRUE))
+  last_glide <- last(which(dive_data$is_glide == FALSE))
+  
+  # Neutral buoyancy points
+  neutral_buoyancy <- tibble(dir = factor(c("desc", "asc")),
+                             datetime = dive_data$datetime[c(first_glide, last_glide)],
+                             p = dive_data$p[c(first_glide, last_glide)])
+  
+  # Dive profile
+  dive_plot <- ggplot(dive_data, aes(datetime, p)) +
+    geom_point(aes(color = is_glide), size = 1) +
+    geom_segment(aes(x = datetime - seconds(30),
+                     xend = datetime + seconds(30),
+                     y = p, 
+                     yend = p),
+                 data = neutral_buoyancy,
+                 inherit.aes = FALSE) +
+    scale_color_aaas() +
+    scale_y_reverse() +
+    labs(title = sprintf("Dive %d", dive)) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.title.x = element_blank())
+  
+  # Gyroscope (Y)
+  gyro_plot <- ggplot(dive_data, aes(datetime, Gy)) +
+    geom_line() +
+    annotate("rect", 
+             xmin = min(dive_data$datetime),
+             xmax = max(dive_data$datetime),
+             ymin = -stroke_thr,
+             ymax = stroke_thr,
+             alpha = 0.25) +
+    theme_minimal() 
+  
+  dive_plot + gyro_plot + patchwork::plot_layout(nrow = 2)
+}
+
+det_buoyant <- function(dive_data, dive_idx) {
+  dive_idx <- dive_idx[[1]]
+  first_glide <- first(which(dive_data$is_glide == TRUE))
+  last_glide <- last(which(dive_data$is_glide == FALSE))
+  
+  tibble(desc_buoyant = dive_data$p[first_glide],
+         asc_buoyant = dive_data$p[last_glide])
+}
+
+depth_thr <- 100
+all_buoyancy <- prh %>% 
+  filter(dive_idx > 0) %>% 
+  semi_join(prh %>% 
+              group_by(dive_idx) %>% 
+              summarize(depth = max(p)) %>% 
+              filter(depth > depth_thr),
+            by = "dive_idx") %>% 
+  group_by(dive_idx) %>% 
+  group_map(det_buoyant)
+```
